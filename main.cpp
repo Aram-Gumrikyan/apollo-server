@@ -3,6 +3,8 @@
 #include "src/InetSocket.h"
 #include "src/UserInput.h"
 
+using namespace std;
+
 enum app_behavior {
     server = 0,
     client = 1,
