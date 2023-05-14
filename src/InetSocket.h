@@ -12,6 +12,7 @@ private:
     int socketFd;
     int port;
     struct sockaddr_in socketAddress{};
+    unsigned char *iv;
     void createServer();
 public:
     explicit InetSocket(int p = 3000);

@@ -8,13 +8,22 @@
 #include <arpa/inet.h>
 #include "InetSocket.h"
 #include "UserInput.h"
+#include "../utils/State.h"
+#include "../cryptography/rsa.h"
+#include "../cryptography/aes.h"
 
 #define BUFFER_SIZE 1024
+
+using std::cout;
+using std::endl;
+using std::stoi;
 
 InetSocket::InetSocket(int p) : port(p), socketFd(-1) {
     socketAddress.sin_family = AF_INET;
     socketAddress.sin_addr.s_addr = INADDR_ANY;
     socketAddress.sin_port = htons(port);
+
+    iv = (unsigned char *) "0123456789012345";
 
     this->createServer();
 }
@@ -54,27 +63,78 @@ void InetSocket::startRequestAcceptingLoop() {
         exit(-3);
     }
 
-    while (true) {
+    State serverRunning(true);
+
+    while (serverRunning.getState()) {
         int clientSocketFd = accept(socketFd, nullptr, nullptr);
         if (clientSocketFd == -1) {
             perror("accept: ");
             exit(-4);
         }
 
-        char buffer[BUFFER_SIZE] = {0};
-        read(clientSocketFd, buffer, BUFFER_SIZE);
-        std::cout << "Message received: " << buffer << std::endl;
+        /**
+         * server sends public key to client
+         */
+        Keypair keys{};
+        generateKeys(keys);
+        string publicKeyPair = std::to_string(keys.pub.n) + "@" + std::to_string(keys.pub.e);
+        const char *publicKeyPairBuffer = publicKeyPair.c_str();
+        send(clientSocketFd, publicKeyPairBuffer, BUFFER_SIZE, 0);
 
-        char response[BUFFER_SIZE] = {};
-        UserInput::prompt(&response, "Submit answer");
+        /**
+         * server sends encryption key for aes
+         */
+        vector<int> secret{};
+        char encryptionKayBuffer[BUFFER_SIZE] = {0};
+        read(clientSocketFd, encryptionKayBuffer, BUFFER_SIZE);
+        string encryptionKayPlain(encryptionKayBuffer);
+        string delimiter = "@";
+        size_t pos = 0;
+        while ((pos = encryptionKayPlain.find(delimiter)) != string::npos) {
+            secret.push_back(stoi(encryptionKayPlain.substr(0, pos)));
+            encryptionKayPlain.erase(0, pos + delimiter.length());
+        }
+        string key = decrypt(keys.pri, secret);
 
-        if (response[0] == 'q' && response[1] == ' ') {
-            break;
+        while (true) {
+            unsigned char cipherText[128];
+            unsigned char decryptedText[128];
+            int decryptedText_len, ciphertext_len;
+
+            unsigned char request[BUFFER_SIZE] = {0};
+            read(clientSocketFd, request, BUFFER_SIZE);
+            unsigned char requestCipherTextLen[10] = {0};
+            read(clientSocketFd, requestCipherTextLen, 10);
+            decryptedText_len = aes::decrypt(
+                    request,
+                    stoi(string(reinterpret_cast<const char *>(requestCipherTextLen))),
+                    (unsigned char *) key.c_str(),
+                    iv,
+                    decryptedText);
+            decryptedText[decryptedText_len] = '\0';
+            std::cout << "Encrypted Message received: " << request << std::endl;
+            std::cout << "Message received: " << decryptedText << std::endl;
+
+            unsigned char response[BUFFER_SIZE] = {};
+            UserInput::prompt(&response, "Submit answer");
+
+            if (response[0] == 'q' && response[1] == 0) {
+                serverRunning.setState(false);
+                break;
+            }
+
+            ciphertext_len = aes::encrypt(
+                    response,
+                    BUFFER_SIZE,
+                    (unsigned char *) key.c_str(),
+                    iv,
+                    cipherText);
+            send(clientSocketFd, cipherText, BUFFER_SIZE, 0);
+            string ciphertext_len_str = std::to_string(ciphertext_len);
+            send(clientSocketFd, ciphertext_len_str.c_str(), ciphertext_len_str.size(), 0);
         }
 
-        send(clientSocketFd, response, BUFFER_SIZE, 0);
-
-//        close(clientSocketFd);
+        close(clientSocketFd);
     }
 }
 
@@ -84,34 +144,61 @@ void InetSocket::sendRequest() {
         exit(-5);
     }
 
-    while (true) {
-        char request[BUFFER_SIZE] = {};
+    PublicKey serverPublicKey{};
+    char serverPublicKeyPairBuffer[BUFFER_SIZE] = {0};
+    read(socketFd, serverPublicKeyPairBuffer, BUFFER_SIZE);
+    string serverPublicKeyPair(serverPublicKeyPairBuffer);
+    size_t delimiter_pos = serverPublicKeyPair.find('@');
+    serverPublicKey.n = stoi(serverPublicKeyPair.substr(0, delimiter_pos));
+    serverPublicKey.e = stoi(serverPublicKeyPair.substr(delimiter_pos + 1));
+
+    string key = "01234567890123456789012345678901";
+    vector<int> encryptedKay = encrypt(serverPublicKey, key);
+    string joinedEncryptedKey;
+    for (auto i: encryptedKay) {
+        joinedEncryptedKey += std::to_string(i) + "@";
+    }
+    const char *joinedEncryptedKeyBuffer = joinedEncryptedKey.c_str();
+    send(socketFd, joinedEncryptedKeyBuffer, BUFFER_SIZE, 0);
+
+    State clientRunning(true);
+
+    while (clientRunning.getState()) {
+        unsigned char cipherText[128];
+        unsigned char decryptedText[128];
+        int decryptedText_len, ciphertext_len;
+
+        unsigned char request[BUFFER_SIZE] = {};
         UserInput::prompt(&request, "Enter message");
 
         if (request[0] == 'q' && request[1] == ' ') {
+            clientRunning.setState(false);
             break;
         }
 
-        //    implement rsa
+        ciphertext_len = aes::encrypt(
+                request,
+                BUFFER_SIZE,
+                (unsigned char *) key.c_str(),
+                iv,
+                cipherText);
+        send(socketFd, cipherText, BUFFER_SIZE, 0);
+        string ciphertext_len_str = std::to_string(ciphertext_len);
+        send(socketFd, ciphertext_len_str.c_str(), ciphertext_len_str.size(), 0);
 
-        send(socketFd, request, BUFFER_SIZE, 0);
-
-
-        std::string response;
-        char buffer[BUFFER_SIZE] = {0};
-        long bytes_received;
-        while ((bytes_received = recv(socketFd, buffer, BUFFER_SIZE, 0)) > 0) {
-            response.append(buffer, bytes_received);
-        }
-        if (bytes_received == -1) {
-            std::cerr << "Failed to receive HTTP response";
-            exit(-7);
-        }
-
-        std::cout << "response: " << response << std::endl;
-
-//        closeServer();
-//        createServer();
+        unsigned char response[BUFFER_SIZE] = {0};
+        read(socketFd, response, BUFFER_SIZE);
+        unsigned char responseCipherTextLen[10] = {0};
+        read(socketFd, responseCipherTextLen, 10);
+        decryptedText_len = aes::decrypt(
+                response,
+                stoi(string(reinterpret_cast<const char *>(responseCipherTextLen))),
+                (unsigned char *) key.c_str(),
+                iv,
+                decryptedText);
+        decryptedText[decryptedText_len] = '\0';
+        std::cout << "encrypted response: " << response << std::endl;
+        std::cout << "response: " << decryptedText << std::endl;
     }
 }
 
